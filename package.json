@@ -1,0 +1,17 @@
+{
+  "name": "smb-queue-trigger-repro",
+  "version": "1.0.0",
+  "description": "Repro project for Function App queue trigger vs Azure Files SMB security profile (case 2606020040009172)",
+  "main": "src/functions/*.js",
+  "scripts": {
+    "start": "func start",
+    "test": "echo \"No tests yet...\""
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@azure/functions": "^4.0.0"
+  },
+  "devDependencies": {}
+}
