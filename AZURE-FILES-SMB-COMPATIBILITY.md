@@ -31,6 +31,59 @@ The two rows marked **required** are the actual compatibility boundary. Everythi
 
 ---
 
+## Why the Maximum Security preset fails, and the exact delta to fix it
+
+**Assumption for this section:** the storage account is used **only** by this Windows Function App — nothing else (no domain-joined VM, no AD DS/Microsoft Entra Kerberos identity, no other share consumer) touches it. This changes the answer for one setting (Kerberos) versus a shared account.
+
+The portal's **Maximum security** preset, exactly as shown on your Security blade, sets:
+
+| Setting group | Maximum security preset (as shipped) |
+|---|---|
+| SMB protocol versions | SMB 3.1.1 only |
+| Authentication mechanisms | **Kerberos only** (NTLM v2 unchecked) |
+| SMB channel encryption | **AES-256-GCM only** |
+| Kerberos ticket encryption | AES-256 only |
+
+Two of these four are why it breaks the app. Two are already fine and need no change:
+
+| Setting | Preset value | Breaks the app? | Why |
+|---|---|:---:|---|
+| SMB protocol versions | SMB 3.1.1 only | **No** | The Functions platform's SMB client already negotiates SMB 3.1.1 by default — no change needed. |
+| Authentication mechanisms | Kerberos only | **Yes** | The content-share mount authenticates exclusively via NTLMv2 (storage-account-key credential). Azure Files has no identity-based/Kerberos connection option for `WEBSITE_CONTENTAZUREFILECONNECTIONSTRING` at all, so Kerberos-only removes the *only* path this mount has. |
+| SMB channel encryption | AES-256-GCM only | **Yes** | Default-configured SMB clients — including the one the Functions platform itself uses — don't negotiate AES-256-GCM without a manual, per-client `Set-SmbClientConfiguration` override that cannot be applied to Functions' platform-managed, multi-tenant compute. |
+| Kerberos ticket encryption | AES-256 only | **No** | Moot either way — this app never actually uses a Kerberos ticket, so its cipher choice has no effect on it. |
+
+### The exact delta: what to remove, what to add, and why
+
+**Remove from the preset:**
+- **Kerberos**, as an authentication mechanism. This isn't the thing that's broken — it's dead weight. This app never authenticates via Kerberos, so leaving it checked only adds a second accepted authentication path to the storage account without adding any capability this app actually uses. Since nothing else uses this account (per the stated scenario), there's no reason to keep it enabled.
+
+**Add back to the preset:**
+- **NTLM v2**, as an authentication mechanism — **mandatory**. Without it, the content-share mount cannot authenticate at all; this is the setting that produced the crash loop in §3.
+- **AES-128-GCM**, as a channel-encryption cipher — **mandatory**. Without it, no default-configured SMB client can complete a session against the share; this is the setting that kept the app broken even after NTLM v2 was restored, in §4.
+
+**Leave unchanged:**
+- SMB protocol versions (SMB 3.1.1 only) — already correct.
+- Kerberos ticket encryption (AES-256 only) — harmless to leave as-is even with Kerberos unchecked; it costs nothing and keeps the account hardened if Kerberos is ever turned back on later for some other consumer.
+
+### Result: the tightest profile that actually works, for a storage account dedicated to this Function App
+
+| Setting | Value | vs. Maximum security preset |
+|---|---|---|
+| Require Encryption in Transit for SMB | Enabled | Unchanged |
+| SMB protocol versions | SMB 3.1.1 only | Unchanged |
+| Authentication mechanisms | **NTLM v2 only** | Swapped — Kerberos removed, NTLM v2 added |
+| SMB channel encryption | **AES-128-GCM + AES-256-GCM** | Widened — AES-128-GCM added back |
+| Kerberos ticket encryption | AES-256 only | Unchanged |
+
+This is narrower than the preset in the one dimension that actually matters — it uses the single authentication mechanism that works, instead of the single one that doesn't — and only wider in channel encryption, where an AES-256-GCM-only restriction isn't achievable for this compute type at all. Comparing "checkbox count" between the two isn't meaningful: a preset that can't authenticate provides zero effective security, only downtime.
+
+We tested this exact combination directly: **NTLM v2 only + AES-128-GCM;AES-256-GCM + SMB 3.1.1 only + AES-256 ticket encryption** restarted cleanly (site healthy in ~10s) and drained a fresh queue message in ~20s with no errors — see §3 and §4 for the full evidence.
+
+**If this storage account is ever shared** with something that genuinely uses Kerberos (a domain-joined VM, or an AD DS/Microsoft Entra Kerberos identity accessing a different share on the same account), re-check Kerberos alongside NTLM v2 — it costs this Function App nothing and restores that other consumer's access path. That variant is what's shown as the default recommendation further down, for accounts where exclusivity isn't guaranteed.
+
+---
+
 ## 1. Require Encryption in Transit for SMB
 
 | | |
@@ -147,24 +200,30 @@ The Function App showed the identical pattern: restoring NTLMv2 alone (while sti
 
 ## Recommended Custom profile for maximum achievable security
 
-| Setting | Recommended value |
-|---|---|
-| Require Encryption in Transit for SMB | **Enabled** |
-| SMB protocol versions | **SMB 3.1.1** only |
-| Authentication mechanisms | **NTLM v2 + Kerberos** (or NTLMv2-only — see §3 caveat) |
-| SMB channel encryption | **AES-128-GCM + AES-256-GCM** |
-| Kerberos ticket encryption | **AES-256** only |
+Two variants, depending on whether this storage account is dedicated to this Function App or shared with something else that uses Kerberos:
 
-This is validated: it survived two independent clean restart cycles with the queue draining in under 20 seconds each time, with no crash-loop behavior.
+| Setting | **Exclusive use** (only this Function App) | **Shared account** (something else may use Kerberos) |
+|---|---|---|
+| Require Encryption in Transit for SMB | Enabled | Enabled |
+| SMB protocol versions | SMB 3.1.1 only | SMB 3.1.1 only |
+| Authentication mechanisms | **NTLM v2 only** | **NTLM v2 + Kerberos** |
+| SMB channel encryption | AES-128-GCM + AES-256-GCM | AES-128-GCM + AES-256-GCM |
+| Kerberos ticket encryption | AES-256 only | AES-256 only |
+
+Both are validated: each survived clean restart cycles with the queue draining in under 20 seconds, with no crash-loop behavior. If you're not certain nothing else authenticates to this account via Kerberos, default to the shared-account variant — it costs this Function App nothing to leave Kerberos checked.
 
 ### Apply via Azure CLI
 
 ```bash
+# Exclusive-use variant (drop --auth-methods to "NTLMv2" only)
 az storage account file-service-properties update -n <storage-account> -g <resource-group> \
   --versions "SMB3.1.1" \
-  --auth-methods "NTLMv2;Kerberos" \
+  --auth-methods "NTLMv2" \
   --kerb-ticket-encryption "AES-256" \
   --channel-encryption "AES-128-GCM;AES-256-GCM"
+
+# Shared-account variant — use this instead if anything else on the account uses Kerberos:
+#   --auth-methods "NTLMv2;Kerberos"
 
 # Always restart immediately after any SMB profile change — an already-mounted
 # instance keeps working regardless of the new setting (SMB Continuous
@@ -175,11 +234,12 @@ az functionapp restart -g <resource-group> -n <function-app-name>
 ### Apply via Azure PowerShell
 
 ```powershell
+# Exclusive-use variant (use -SmbAuthenticationMethod "NTLMv2","Kerberos" for a shared account)
 Update-AzStorageFileServiceProperty `
   -ResourceGroupName <resource-group> `
   -StorageAccountName <storage-account> `
   -SmbProtocolVersion "SMB3.1.1" `
-  -SmbAuthenticationMethod "NTLMv2","Kerberos" `
+  -SmbAuthenticationMethod "NTLMv2" `
   -SmbKerberosTicketEncryption "AES-256" `
   -SmbChannelEncryption "AES-128-GCM","AES-256-GCM"
 
@@ -191,7 +251,7 @@ Restart-AzFunctionApp -ResourceGroupName <resource-group> -Name <function-app-na
 1. Storage account → **Data storage → File shares** → **File share settings** → **Security**.
 2. Profile → **Custom**.
 3. SMB protocol versions: check **SMB 3.1.1** only.
-4. Authentication mechanisms: check **NTLM v2** (and Kerberos, unless you've confirmed nothing else on the account needs it).
+4. Authentication mechanisms: check **NTLM v2**. Check **Kerberos** too, unless you've confirmed nothing else on the account needs it (see the delta discussion above).
 5. SMB channel encryption: check **AES-128-GCM** and **AES-256-GCM** (leave AES-128-CCM unchecked).
 6. Kerberos ticket encryption: check **AES-256** only.
 7. **Save**, then restart the Function App from its Overview blade to force the new mount to take effect.
